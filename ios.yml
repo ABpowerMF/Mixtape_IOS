@@ -1,0 +1,89 @@
+name: Mixtape iPhone
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Works with either of these in the repo:
+      #  - the zip (any name with "ios" in it, in any folder, e.g. "Mixtape-iOS-v0.1 (1).zip")
+      #  - the project itself (the unzipped folder, or its files right in the repo root)
+      - name: Find the project
+        run: |
+          echo "Files in the repo:"
+          find . -maxdepth 3 -not -path './.git*' | head -80
+          ZIP=$(find . -iname '*.zip' -not -path './.git/*' | grep -i 'ios' | sort -V | tail -1)
+          if [ -n "$ZIP" ]; then
+            echo "Using zip: $ZIP"
+            rm -rf build-src && mkdir build-src
+            ditto -x -k "$ZIP" build-src
+            SEARCH=build-src
+          else
+            echo "No iOS zip found: looking for the project files in the repo"
+            SEARCH=.
+          fi
+          YML=$(grep -rl --include=project.yml 'dev.mixtape.player' "$SEARCH" | grep -v '__MACOSX' | head -1)
+          if [ -z "$YML" ]; then
+            echo "::error::Couldn't find the Mixtape iPhone project (no zip with 'ios' in its name, and no project.yml)."
+            exit 1
+          fi
+          DIR=$(cd "$(dirname "$YML")" && pwd)
+          VERSION=$(grep 'MARKETING_VERSION' "$YML" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Project folder: $DIR  (version $VERSION)"
+          echo "PROJECT=$DIR" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Make the Xcode project
+        working-directory: ${{ env.PROJECT }}
+        run: xcodegen generate
+
+      - name: Build
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          xcodebuild -project Mixtape.xcodeproj -scheme Mixtape -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > build.log 2>&1 || {
+              echo "Build failed. The errors:"
+              grep -E "error:" build.log | sort -u | head -40 | while IFS= read -r line; do
+                echo "::error::${line#*/Mixtape/}"
+              done
+              echo "----- end of the log -----"
+              tail -60 build.log
+              exit 1
+            }
+          grep -E "\*\* BUILD" build.log
+
+      - name: Make the .ipa
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          cd ipa && zip -qry "../Mixtape-iOS-v${VERSION}.ipa" Payload
+          ls -lh "../Mixtape-iOS-v${VERSION}.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mixtape-iOS-v${{ env.VERSION }}
+          path: ${{ env.PROJECT }}/Mixtape-iOS-v${{ env.VERSION }}.ipa
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-v${{ env.VERSION }}
+          name: Mixtape for iPhone v${{ env.VERSION }}
+          body: Install the .ipa with Sideloadly.
+          files: ${{ env.PROJECT }}/Mixtape-iOS-v${{ env.VERSION }}.ipa
